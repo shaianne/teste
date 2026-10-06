@@ -1,0 +1,145 @@
+CONTEXTO DO PROJETO
+
+Estou desenvolvendo um pipeline Databricks + Spark para classificação de conversas da assistente virtual VIC.
+
+O objetivo é gerar a tabela fat_conversa_vic contendo o desfecho final de cada conversa.
+
+A arquitetura atual possui:
+
+Amazon Connect ChatTranscript
+Amazon Connect Analysis (Contact Lens)
+Enriquecimento CRM via CPF
+Classificação determinística
+Classificação via IA apenas para casos residuais
+PROBLEMA PRINCIPAL
+
+A implementação atual ficou pesada e difícil de operacionalizar.
+
+A classificação por IA foi integrada ao fluxo principal e qualquer ação Spark está ficando extremamente lenta.
+
+Objetivo: simplificar ao máximo e tornar o processamento performático.
+
+RESTRIÇÕES IMPORTANTES
+Terraform
+
+Não podemos utilizar operador & em expressões Python/PySpark porque o Terraform/Linter da empresa acusa erro.
+
+Exemplo:
+
+Python
+(col("a") == 1) & (col("b") == 2)
+
+Deve ser substituído sempre por:
+
+Python
+(col("a") == 1) and (col("b") == 2)
+
+ou preferência por:
+
+Python
+F.when(
+(condicao1) and (condicao2)
+)
+
+Sempre considerar essa restrição.
+
+CENÁRIO ATUAL
+
+Tenho aproximadamente:
+
+Plain Text
+37.000 registros
+
+Após aplicar regras determinísticas:
+
+Plain Text
+20.543 registros classificados
+
+Sobram aproximadamente:
+
+Plain Text
+17.000 registros
+
+para classificação por IA.
+
+REGRAS DE NEGÓCIO
+
+Existem desfechos que podem ser determinados sem IA.
+
+Exemplos:
+
+Plain Text
+Acordo fechado
+Segunda via boleto
+Transferido para atendente
+Sem dívida
+Erro técnico
+Fora do horário
+Sem interação do cliente
+
+Esses casos NÃO deveriam passar pelo modelo.
+
+ARQUITETURA DESEJADA
+
+Quero uma arquitetura simples.
+
+Passo 1:
+
+Plain Text
+Leitura das fontes
+
+Passo 2:
+
+Plain Text
+Aplicar regras determinísticas
+
+Passo 3:
+
+Plain Text
+Separar:
+Python
+df_deterministico
+
+e
+
+Python
+df_pendente
+
+Onde:
+
+Python
+df_deterministico =
+_tp_desfecho_deterministico IS NOT NULL
+
+e
+
+Python
+df_pendente =
+_tp_desfecho_deterministico IS NULL
+OBJETIVO
+
+Quero gravar imediatamente os registros determinísticos.
+
+Exemplo:
+
+Python
+df_deterministico.write \
+.format("delta") \
+.mode("append") \
+.saveAsTable(...)
+
+Sem passar pela IA.
+
+Depois executar IA somente para:
+
+Python
+df_pendente
+
+E gravar o resultado da IA separadamente.
+
+PROBLEMAS ENCONTRADOS
+ai_query extremamente lento
+
+Mesmo com poucos registros.
+
+Queremos reduzir ao máximo as chamadas.
