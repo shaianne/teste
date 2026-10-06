@@ -1,0 +1,1043 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Helpers — Gold `vic_connect`
+# MAGIC
+# MAGIC Funções compartilhadas pelos notebooks de fato e refined do projeto.
+# MAGIC
+# MAGIC ## Por que a classificação é híbrida
+# MAGIC
+# MAGIC O relatório executivo pede seis desfechos e três taxonomias de motivo. Parte disso
+# MAGIC está em marcador explícito na transcrição, parte só existe na leitura do diálogo.
+# MAGIC
+# MAGIC Casamento por expressão regular sozinho **não** resolve. Medido na amostra de 92
+# MAGIC conversas: `'boleto'` aparece em 36 conversas, mas só 8 têm documento efetivamente
+# MAGIC enviado e apenas 2 são acordo fechado — as outras 6 são segunda via. O verbo aparece
+# MAGIC no menu de opções do assistente (`"gerar a 2ª via do seu boleto ou negociar"`), muito
+# MAGIC antes de qualquer desfecho.
+# MAGIC
+# MAGIC IA sozinha também não resolve: pedindo o desfecho direto ao modelo, uma conversa que
+# MAGIC apenas ofereceu as duas opções e terminou foi classificada como `Acordo fechado`.
+# MAGIC
+# MAGIC Então:
+# MAGIC
+# MAGIC - **Determinístico** para o que tem marcador inequívoco: envio de documento, evento
+# MAGIC   `transfer.succeeded`, evento `lex.event.response.failed`.
+# MAGIC - **IA** apenas para o residual e para os motivos, com domínio fechado por `enum` no
+# MAGIC   `responseFormat`, e recebendo o veredito determinístico como contexto.
+# MAGIC
+# MAGIC ## Por que o cache de classificação existe
+# MAGIC
+# MAGIC `ai_query` não é determinístico. Sem cache, cada execução reclassificaria todas as
+# MAGIC conversas; o `xxhash64` das colunas de negócio mudaria sem mudança na origem, e o
+# MAGIC `merge_dinamico` encerraria e reinseriria a fato inteira a cada carga. `classificar_conversa`
+# MAGIC relê o que já está gravado e só chama o modelo para `ContactId` novo.
+
+# COMMAND ----------
+
+# DBTITLE 1,Imports
+from pyspark.sql.functions import (
+    aggregate,
+    array_distinct,
+    coalesce,
+    col,
+    concat,
+    concat_ws,
+    exists,
+    expr,
+    filter as filtrar_array,
+    from_json,
+    length,
+    lit,
+    lower,
+    regexp_extract,
+    regexp_replace,
+    sha2,
+    size,
+    split,
+    substring,
+    transform as transformar_array,
+    trim,
+    try_element_at,
+    upper,
+    when,
+    xxhash64,
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Constantes de controle SCD2
+# Gerenciadas pelo merge_dinamico. Os notebooks de carga não devem preenchê-las.
+COLUNAS_CONTROLE_SCD2 = [
+    "ts_inicio_registro",
+    "ts_fim_registro",
+    "in_registro_ativo",
+    "ts_atualizacao_registro",
+    "cd_chave_registro",
+]
+
+DDL_CONTROLE_SCD2 = {
+    "ts_inicio_registro": "timestamp",
+    "ts_fim_registro": "timestamp",
+    "in_registro_ativo": "string",
+    "ts_atualizacao_registro": "timestamp",
+    "cd_chave_registro": "bigint",
+}
+
+COMENTARIO_CONTROLE_SCD2 = {
+    "ts_inicio_registro": "Data e hora em que a versao do registro passou a valer. Gerenciada pelo merge_dinamico. Usada para reconstruir o historico da conversa. Exemplo: 2026-09-11 21:03:19.",
+    "ts_fim_registro": "Data e hora em que a versao do registro deixou de valer; nula na versao corrente. Gerenciada pelo merge_dinamico. Filtrar por nulo devolve o estado atual. Exemplo: 2026-09-11 21:03:19.",
+    "in_registro_ativo": "Indicador da versao corrente do registro. Gerenciada pelo merge_dinamico. Filtro padrao de leitura na camada gold. Exemplo: Ativo, Inativo.",
+    "ts_atualizacao_registro": "Data e hora da ultima escrita sobre o registro. Gerenciada pelo merge_dinamico. Usada para auditoria de carga. Exemplo: 2026-09-11 21:03:19.",
+    "cd_chave_registro": "Hash xxhash64 das colunas de negocio do registro. Gerenciada pelo merge_dinamico. Chave de comparacao do MERGE que detecta mudanca de conteudo. Exemplo: -4521098773310025519.",
+}
+
+# COMMAND ----------
+
+# DBTITLE 1,Domínio dos desfechos e motivos
+
+# Rótulos finais expostos ao negócio. O modelo devolve códigos ASCII (ver PROMPT_*) e o
+# mapeamento acontece em Spark: `enum` com acento depende de decodificação restrita
+# multibyte no endpoint, e ASCII elimina esse risco sem custo de legibilidade.
+
+DESFECHO_ACORDO_FECHADO = "Acordo fechado"
+DESFECHO_SEGUNDA_VIA = "Segunda via de boleto"
+DESFECHO_TRANSFERIDO = "Transferido para atendente"
+DESFECHO_SEM_DIVIDA = "Sem dívida"
+DESFECHO_ERRO_TECNICO = "Erro técnico"
+DESFECHO_ABANDONO = "Abandono do cliente"
+DESFECHO_RECUSA = "Recusa de condições"
+DESFECHO_FORA_ESCOPO = "Fora de escopo"
+DESFECHO_NAO_CLASSIFICADO = "Não classificado"
+
+# Dois desfechos que não estavam na especificação original do relatório e apareceram na
+# apuração: são contatos que nunca viraram conversa. Ocorrem apenas em
+# `connect_bbts_cobranca.chattranscripts`, porque o Contact Lens não analisa contato sem
+# diálogo — e é justamente por isso que eles faltavam em `analysis.chat`.
+DESFECHO_FORA_HORARIO = "Fora do horário de atendimento"
+DESFECHO_SEM_INTERACAO = "Sem interação do cliente"
+
+NAO_APLICAVEL = "Não aplicável"
+
+# Rótulo residual das taxonomias de motivo. Necessário porque o modelo às vezes devolve
+# NAO_APLICAVEL mesmo quando o desfecho exige um motivo — medido na amostra: 1 conversa
+# classificada como abandono veio sem etapa. Sem este rótulo, a seção 4 do relatório
+# exibiria "Não aplicável" como fatia, que não é informação de negócio.
+SEM_CAUSA_CLARA = "Sem causa clara"
+
+# Domínio completo de tp_desfecho. Usado na validação da fato e na ordenação do relatório.
+DESFECHOS_VALIDOS = [
+    DESFECHO_ACORDO_FECHADO,
+    DESFECHO_SEGUNDA_VIA,
+    DESFECHO_TRANSFERIDO,
+    DESFECHO_SEM_DIVIDA,
+    DESFECHO_ERRO_TECNICO,
+    DESFECHO_FORA_HORARIO,
+    DESFECHO_SEM_INTERACAO,
+    DESFECHO_ABANDONO,
+    DESFECHO_RECUSA,
+    DESFECHO_FORA_ESCOPO,
+    DESFECHO_NAO_CLASSIFICADO,
+]
+
+# Desfechos que a IA pode decidir. Os determinísticos nunca são delegados ao modelo.
+MAPA_DESFECHO_IA = {
+    "ABANDONO": DESFECHO_ABANDONO,
+    "RECUSA": DESFECHO_RECUSA,
+    "FORA_ESCOPO": DESFECHO_FORA_ESCOPO,
+    "SEM_DESFECHO": DESFECHO_NAO_CLASSIFICADO,
+}
+
+# Item 4 do relatório — etapa do funil em que o cliente parou de responder.
+MAPA_ETAPA_ABANDONO = {
+    "ANTES_NOME": "Antes do nome",
+    "APOS_NOME_SEM_CPF": "Após nome, sem CPF",
+    "APOS_CPF": "Após CPF",
+    "NA_PROPOSTA": "Na proposta",
+    "NA_CONFIRMACAO": "Na confirmação",
+    "SEM_CAUSA_CLARA": SEM_CAUSA_CLARA,
+    "NAO_APLICAVEL": NAO_APLICAVEL,
+}
+
+# Item 5 do relatório — por que o cliente recusou a condição oferecida.
+MAPA_MOTIVO_RECUSA = {
+    "SEM_CONDICAO_FINANCEIRA": "Sem condições financeiras",
+    "SAIU_APOS_PROPOSTA": "Saiu após proposta",
+    "NAO_RECONHECE_DIVIDA": "Não reconhece a dívida",
+    "ENTRADA_MUITO_ALTA": "Entrada muito alta",
+    "PARCELA_ACIMA_CAPACIDADE": "Parcela acima da capacidade",
+    "PREFERE_OUTRO_CANAL": "Prefere outro canal",
+    "QUER_MAIS_DESCONTO": "Quer mais desconto",
+    "NAO_APLICAVEL": NAO_APLICAVEL,
+}
+
+# Item 6 do relatório — por que a conversa foi escalada para atendente humano.
+MAPA_MOTIVO_TRANSFERENCIA = {
+    "APOS_ERRO_TECNICO": "Após erro técnico",
+    "SOLICITACAO_CLIENTE": "Solicitação explícita do cliente",
+    "VALIDACAO_CADASTRAL": "Problema de validação cadastral",
+    "FORA_ESCOPO_VIC": "Assunto fora do escopo da VIC",
+    "NAO_APLICAVEL": NAO_APLICAVEL,
+}
+
+# COMMAND ----------
+
+# DBTITLE 1,Marcadores textuais da transcrição
+
+# Assinatura do template de anexo do Amazon Connect. É o único sinal inequívoco de que um
+# documento (boleto ou termo) saiu para o cliente. Detectado dentro do payload JSON, e não no
+# texto de prosa, por isso é constante separada dos MARCADOR_* abaixo.
+TEMPLATE_DOCUMENTO_ENVIADO = "whatsappdocument"
+
+# Texto de fechamento do assistente. Só aparece depois de o cliente aceitar a condição.
+# Medido na amostra: separa os 2 acordos reais das 6 segundas vias entre os 8 envios.
+MARCADOR_CONFIRMACAO_ACORDO = r"vamos fechar assim|confirma a negocia|informações importantes"
+
+MARCADOR_TRANSFERENCIA = r"vou te transferir|vou transferir|transferir (voce|você|o atendimento)|transferindo|falar com (um|uma) atendente|atendente humano"
+
+MARCADOR_SEM_DIVIDA = r"não (encontrei|localizei|constam|consta|há|tem) [^|]{0,40}pend[êe]nci|sem pend[êe]nci|nenhuma pend[êe]nci|não (possui|tem) [^|]{0,40}d[íi]vida"
+
+MARCADOR_ERRO_TECNICO = r"instabilidade|problema técnico|erro no sistema|sistema (está|fora)|falha (na|no|técnica)|indisponível no momento"
+
+# Mensagem automática de fora do horário comercial. O trecho é longo de propósito: "por
+# segurança" isolado apareceria em orientação de segurança dentro de conversa normal.
+MARCADOR_FORA_HORARIO = r"por segurança, algumas transações"
+
+# Eventos estruturados do Connect. Mais confiáveis que qualquer texto.
+EVENTO_TRANSFERENCIA = "application/vnd.amazonaws.connect.event.transfer.succeeded"
+EVENTO_FALHA_LEX = "application/vnd.amazonaws.lex.event.response.failed"
+
+# COMMAND ----------
+
+# DBTITLE 1,Extração de campos da transcrição
+
+
+def _e_payload_template(coluna_conteudo):
+    """Indica se o conteúdo da mensagem é um payload JSON de template, e não conversa.
+
+    Usa expressão regular em vez de `trim(...) LIKE '{%'` porque o `trim` do Spark remove
+    apenas o caractere espaço, e **não** a quebra de linha. O template `WhatsAppDocument` vem
+    com `\\n` antes da chave de abertura, então a versão com `trim` deixava passar justamente o
+    payload que carrega a URL do boleto com nome do cliente e assinatura SAS.
+    """
+    return coluna_conteudo.rlike(r"^\s*\{")
+
+
+def texto_prosa(coluna_transcript=col("Transcript")):
+    """Concatena só o texto conversacional da transcrição, em minúsculas.
+
+    **Descarta os payloads JSON de template.** O Connect envia templates (`ViewResource`,
+    `WhatsAppDocument`) como conteúdo de mensagem, e dentro deles vão rótulos de menu da
+    interface. Casar marcador de prosa nesse JSON produz falso positivo: medido na amostra,
+    o template `ViewResource` contém o rótulo "falar com um atendente", o que classificava
+    como transferido 2 contatos em que o cliente **nunca escreveu nada**.
+
+    O corte é por chave de abertura no início do conteúdo, que separa payload de prosa sem
+    depender de conhecer todos os tipos de template.
+
+    As mensagens são separadas por ` || ` em vez de espaço para que um marcador não case
+    acidentalmente atravessando a fronteira entre duas mensagens.
+    """
+    apenas_prosa = filtrar_array(
+        coluna_transcript,
+        lambda m: m.Content.isNotNull() & ~_e_payload_template(m.Content),
+    )
+    return lower(concat_ws(" || ", transformar_array(apenas_prosa, lambda m: m.Content)))
+
+
+def contem_template_documento(coluna_transcript=col("Transcript")):
+    """Indica se algum documento foi enviado ao cliente, olhando o payload do template.
+
+    Complementa `texto_prosa`: a detecção do anexo precisa justamente do JSON que aquela
+    função descarta. Por isso é estrutural, e não casamento de prosa.
+    """
+    return exists(
+        coluna_transcript,
+        lambda m: lower(coalesce(m.Content, lit(""))).contains(lit(TEMPLATE_DOCUMENTO_ENVIADO)),
+    )
+
+
+def montar_dialogo(coluna_transcript=col("Transcript"), limite_caracteres=700):
+    """Monta o diálogo legível, usado no prompt da IA e como base da versão anonimizada.
+
+    Mantém apenas mensagens (descarta eventos de entrada e saída de participante, que não
+    carregam conteúdo) e prefixa cada linha com o papel: `SYSTEM` é o assistente VIC,
+    `CUSTOMER` é o cliente e `AGENT` é o atendente humano.
+
+    **Descarta os payloads JSON de template**, pela mesma regra de `texto_prosa`, e aqui a
+    razão é mais forte. O template `ViewResource` carrega um bloco estruturado com nome
+    completo, CPF e telefone do cliente, mais um `viewToken` de acesso:
+
+        {"Label":"nome","Value":"Nathalia Almeida Andrade"},
+        {"Label":"CPF","Value":"07116641530"},
+        {"Label":"Telefone","Value":"558193770084"}
+
+    Esse bloco não é conversa e não serve à avaliação de qualidade, mas escaparia da redação
+    de nomes quando o cliente não tem `DisplayName` nem cadastro no CRM — justamente os casos
+    em que não há de onde tirar a lista de palavras a redigir.
+
+    Custo medido na amostra: 18 das 1.552 mensagens. Todas as 18 pertencem a contatos que não
+    têm nenhuma mensagem de prosa, ou seja, contatos sem conversa a avaliar.
+    """
+    mensagens = filtrar_array(
+        coluna_transcript,
+        lambda m: (m.Type == lit("MESSAGE")) & m.Content.isNotNull() & ~_e_payload_template(m.Content),
+    )
+    return concat_ws(
+        "\n",
+        transformar_array(
+            mensagens,
+            lambda m: concat(m.ParticipantRole, lit(": "), substring(m.Content, 1, limite_caracteres)),
+        ),
+    )
+
+
+def extrair_cpf_cliente(coluna_transcript=col("Transcript")):
+    """Extrai o CPF que o cliente digitou no chat.
+
+    Considera apenas mensagens do cliente cujo conteúdo, depois de remover tudo que não é
+    dígito, tenha exatamente 11 posições. O critério é restritivo de propósito: valores
+    monetários, números de parcela e datas também são dígitos, e um casamento frouxo
+    ligaria a conversa ao CPF de outra pessoa.
+
+    Devolve o primeiro CPF válido, ou nulo quando o cliente não se identificou — o que
+    ocorre em 40 das 92 conversas da amostra.
+    """
+    candidatos = transformar_array(
+        coluna_transcript,
+        lambda m: when(
+            (m.ParticipantRole == lit("CUSTOMER")) & (m.Type == lit("MESSAGE")),
+            regexp_extract(regexp_replace(m.Content, "[^0-9]", ""), "^([0-9]{11})$", 1),
+        ),
+    )
+    validos = filtrar_array(candidatos, lambda v: v.isNotNull() & (v != lit("")))
+
+    # `try_element_at` e não `element_at`: com ANSI ligado, `element_at` sobre array vazio
+    # lança INVALID_ARRAY_INDEX_IN_ELEMENT_AT em vez de devolver nulo. Array vazio é o caso
+    # normal aqui, não a exceção — em 63 dos 115 contatos o cliente não informou CPF.
+    return try_element_at(validos, lit(1))
+
+
+def extrair_nome_exibicao(papel, coluna_transcript=col("Transcript")):
+    """Extrai o nome de exibição de um papel na transcrição.
+
+    Para `CUSTOMER` é o nome do perfil do WhatsApp, que costuma ser o nome real da pessoa —
+    portanto é dado pessoal. Para `AGENT` é o nome do atendente, que é dado pessoal de
+    colaborador. Ambos entram na lista de redação da versão anonimizada.
+
+    Descarta os valores sintéticos do assistente (`BOT`, `SYSTEM_MESSAGE`).
+    """
+    nomes = filtrar_array(
+        coluna_transcript,
+        lambda m: (m.ParticipantRole == lit(papel))
+        & m.DisplayName.isNotNull()
+        & ~m.DisplayName.isin("BOT", "SYSTEM_MESSAGE"),
+    )
+    # `try_element_at` pelo mesmo motivo de `extrair_cpf_cliente`: contato sem atendente humano
+    # não tem nenhum DisplayName de AGENT, e o array vazio faria `element_at` lançar exceção.
+    return try_element_at(transformar_array(nomes, lambda m: m.DisplayName), lit(1))
+
+
+def normalizar_cpf_crm(coluna_cpf):
+    """Normaliza o CPF do CRM para casar com o do chat.
+
+    `bbts_prdim.pessoa.pessoa.nu_cpf_cnpj_pessoa` vem com 14 posições e zeros à esquerda
+    (`00060384549934`), enquanto o cliente digita 11 (`60384549934`). O corte pelos 11
+    dígitos finais alinha os dois e resolve 51 dos 52 CPFs da amostra.
+    """
+    return expr(f"right(regexp_replace({coluna_cpf}, '[^0-9]', ''), 11)")
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Normalização do produto da dívida
+
+# Grupos pedidos pelo negócio no item 3 do relatório, na ordem de avaliação. A ordem
+# importa: `CH ESP CLASSIC` casa com "Cheque Especial" e com "Limite Classic", e
+# `RENEGOCIACAO AUTOMATICA PF` casa com "Renegociação" e com "Crédito Automático". O
+# primeiro padrão que casar vence, então o mais específico vem antes.
+GRUPO_PRODUTO = [
+    ("Ourocard", r"OUROCARD|PRIVATE LABEL"),
+    # `CHEQUE ESP` e `CH OURO` são necessários além das grafias completas: a origem tem
+    # `PARC CHEQUE ESP` e `CH OURO EMPRESARIAL`, que `CH ESP` e `CHEQUE OURO` não pegam.
+    ("Cheque Especial", r"CH ESP|CHEQUE ESP|CH OURO|CHEQUE OURO"),
+    ("Renegociação", r"RENEG"),
+    # `CONSIG` cobre CONSIGNACAO, CONSIGNADO e a abreviação de `BB CONSIG-COMPRA DIV`.
+    ("Crédito Consignado", r"CONSIG"),
+    ("Crédito Renovação", r"RENOVACAO|RENOV "),
+    ("Crédito Automático", r"AUTOMATICO"),
+    ("Crédito Salário", r"SALARIO"),
+    ("Crédito Benefício", r"BENEFICIO"),
+    ("CDC", r"\bCDC\b|CREDIARIO"),
+    ("Empréstimo Pessoal", r"EMPRESTIMO|MICROCREDITO"),
+    ("Adiantamento a Depositantes", r"ADIANT"),
+    ("Limite Classic", r"CLASSIC"),
+]
+
+GRUPO_PRODUTO_OUTROS = "Outros"
+
+
+def normalizar_grupo_produto(coluna_produto):
+    """Agrupa o produto bruto do CRM nos grupos de negócio do relatório.
+
+    `bbts_prdim.divida.divida.tx_produto` não é padronizado: o mesmo produto aparece como
+    `BB CRED. RENOVACAO` e `BB CREDITO RENOVACAO`, `CH ESP CLASSIC` e
+    `CHEQUE ESPECIAL CLASSIC`. São mais de 40 grafias para cerca de 12 grupos reais.
+
+    Fora do domínio conhecido devolve `Outros` em vez de nulo, para que o total por grupo
+    feche com o total de acordos. `tx_produto_origem` preserva o valor bruto.
+    """
+    coluna_maiuscula = upper(coalesce(coluna_produto, lit("")))
+
+    expressao = None
+    for grupo, padrao in GRUPO_PRODUTO:
+        condicao = coluna_maiuscula.rlike(padrao)
+        expressao = when(condicao, lit(grupo)) if expressao is None else expressao.when(condicao, lit(grupo))
+
+    return expressao.otherwise(lit(GRUPO_PRODUTO_OUTROS))
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Sinais determinísticos do desfecho
+
+
+def adicionar_sinais_deterministicos(df, coluna_transcript="Transcript"):
+    """Deriva os indicadores de desfecho que têm marcador inequívoco na transcrição.
+
+    Devolve o DataFrame acrescido de `_tx_prosa`, `_tx_dialogo` e das colunas `in_*`.
+    As colunas com prefixo `_` são auxiliares e devem ser descartadas antes da gravação.
+
+    Todo marcador de prosa é casado contra `_tx_prosa`, que exclui os payloads JSON de
+    template — ver `texto_prosa`. A única exceção é o envio de documento, que é detectado
+    justamente dentro do payload.
+    """
+    transcript = col(coluna_transcript)
+
+    df_sinais = (
+        df.withColumn("_tx_prosa", texto_prosa(transcript))
+        .withColumn("_tx_dialogo", montar_dialogo(transcript))
+        .withColumn("_in_documento_enviado", contem_template_documento(transcript))
+        .withColumn("_in_confirmacao_acordo", col("_tx_prosa").rlike(MARCADOR_CONFIRMACAO_ACORDO))
+        # Evento estruturado do Connect. Separado do indicador final porque também governa a
+        # precedência: um transbordo registrado pelo Connect vence a ausência de interação.
+        .withColumn("_in_evento_transferencia", exists(transcript, lambda m: m.ContentType == lit(EVENTO_TRANSFERENCIA)))
+        .withColumn(
+            "in_atendente_humano_presente",
+            exists(transcript, lambda m: (m.ParticipantRole == lit("AGENT")) & (m.Type == lit("MESSAGE"))),
+        )
+        .withColumn(
+            "in_erro_tecnico",
+            exists(transcript, lambda m: m.ContentType == lit(EVENTO_FALHA_LEX))
+            | col("_tx_prosa").rlike(MARCADOR_ERRO_TECNICO),
+        )
+        .withColumn("in_sem_divida", col("_tx_prosa").rlike(MARCADOR_SEM_DIVIDA))
+        .withColumn("in_fora_horario_atendimento", col("_tx_prosa").rlike(MARCADOR_FORA_HORARIO))
+        # Contato sem nenhuma mensagem do cliente. São os casos em que o assistente exibiu um
+        # template `ViewResource` e o cliente saiu sem escrever nada: 18 dos 115 contatos da
+        # amostra. Contam como contato, mas não como conversa.
+        .withColumn(
+            "in_sem_interacao_cliente",
+            size(filtrar_array(transcript, lambda m: (m.Type == lit("MESSAGE")) & (m.ParticipantRole == lit("CUSTOMER"))))
+            == lit(0),
+        )
+    )
+
+    # Acordo fechado exige as duas evidências. Documento sem texto de fechamento é segunda
+    # via: na amostra são 6 dos 8 envios, e tratá-los como acordo quadruplicaria a taxa de
+    # conversão informada ao negócio.
+    df_sinais = (
+        df_sinais.withColumn(
+            "in_acordo_fechado",
+            col("_in_documento_enviado") & col("_in_confirmacao_acordo"),
+        )
+        .withColumn(
+            "in_segunda_via_boleto",
+            col("_in_documento_enviado") & ~col("_in_confirmacao_acordo"),
+        )
+        .withColumn(
+            "in_transferido_atendente",
+            col("_in_evento_transferencia") | col("_tx_prosa").rlike(MARCADOR_TRANSFERENCIA),
+        )
+    )
+
+    return df_sinais
+
+
+def desfecho_deterministico():
+    """Resolve o desfecho quando há marcador inequívoco; nulo quando cabe à IA decidir.
+
+    A ordem não é arbitrária.
+
+    **Ausência de interação vem primeiro.** Se o cliente não escreveu nada, nenhum desfecho
+    pode ser atribuído ao comportamento dele — qualquer texto na transcrição é só roteiro do
+    assistente. A exceção é o evento `transfer.succeeded`: um transbordo registrado pelo
+    Connect aconteceu de fato, mesmo sem o cliente escrever.
+
+    **Depois, do mais conclusivo para o menos.** Um acordo fechado continua sendo acordo
+    fechado mesmo que a conversa depois passe por um atendente humano.
+
+    **Fora do horário antes de nada mais textual**, porque é mensagem automática que encerra
+    o atendimento antes de qualquer negociação.
+
+    `in_atendente_humano_presente` de propósito **não** entra aqui. Na amostra, 22 conversas
+    têm mensagem de atendente, mas o roteiro de encerramento por inatividade também é
+    enviado por atendente ("Por falta de comunicação, o contato será encerrado"). Só o
+    evento `transfer.succeeded` e o texto explícito de transferência caracterizam escalada.
+    """
+    return (
+        when(
+            col("in_sem_interacao_cliente") & ~col("_in_evento_transferencia"),
+            lit(DESFECHO_SEM_INTERACAO),
+        )
+        .when(col("in_acordo_fechado"), lit(DESFECHO_ACORDO_FECHADO))
+        .when(col("in_segunda_via_boleto"), lit(DESFECHO_SEGUNDA_VIA))
+        .when(col("in_transferido_atendente"), lit(DESFECHO_TRANSFERIDO))
+        .when(col("in_sem_divida"), lit(DESFECHO_SEM_DIVIDA))
+        .when(col("in_erro_tecnico"), lit(DESFECHO_ERRO_TECNICO))
+        .when(col("in_fora_horario_atendimento"), lit(DESFECHO_FORA_HORARIO))
+        .otherwise(lit(None).cast("string"))
+    )
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Classificação por IA
+
+MODELO_IA = "databricks-meta-llama-3-3-70b-instruct"
+
+PROMPT_CLASSIFICACAO = """Voce analisa conversas de cobranca da assistente virtual VIC, da BBTS a servico do Banco do Brasil.
+
+Papeis na transcricao:
+- SYSTEM: a assistente virtual VIC
+- CUSTOMER: o cliente devedor
+- AGENT: atendente humano
+
+Fluxo normal da VIC: saudacao, pedido do nome completo, pedido do CPF, consulta das pendencias, pergunta sobre capacidade de pagamento, apresentacao da proposta, confirmacao, envio do boleto.
+
+Classifique quatro campos.
+
+tp_desfecho_ia: como a conversa terminou.
+- ABANDONO: o cliente parou de responder e a conversa foi encerrada por inatividade.
+- RECUSA: o cliente respondeu recusando a condicao oferecida, ou disse que nao consegue pagar.
+- FORA_ESCOPO: o cliente procurou assunto que a VIC nao trata (nao e negociacao de divida nem segunda via de boleto).
+- SEM_DESFECHO: a conversa e curta demais ou ambigua para enquadrar acima.
+
+tp_etapa_abandono_ia: se e ABANDONO, em que ponto do fluxo o cliente parou. Senao, NAO_APLICAVEL.
+- ANTES_NOME: nao informou o nome completo.
+- APOS_NOME_SEM_CPF: informou o nome e parou antes do CPF.
+- APOS_CPF: informou o CPF e parou antes de ver a proposta.
+- NA_PROPOSTA: viu a proposta e parou sem responder.
+- NA_CONFIRMACAO: aceitou e parou na confirmacao final.
+- SEM_CAUSA_CLARA: abandonou em ponto que nao se encaixa acima.
+
+tp_motivo_recusa_ia: se e RECUSA, por que. Senao, NAO_APLICAVEL.
+- SEM_CONDICAO_FINANCEIRA: declarou estar sem dinheiro, desempregado ou apertado.
+- ENTRADA_MUITO_ALTA: reclamou especificamente do valor da entrada.
+- PARCELA_ACIMA_CAPACIDADE: reclamou especificamente do valor da parcela.
+- QUER_MAIS_DESCONTO: pediu desconto maior que o oferecido.
+- NAO_RECONHECE_DIVIDA: negou a divida ou disse que ja pagou.
+- PREFERE_OUTRO_CANAL: disse que resolveria por agencia, aplicativo, Serasa ou outro canal.
+- SAIU_APOS_PROPOSTA: recusou sem dar motivo identificavel.
+
+tp_motivo_transferencia_ia: se houve transferencia para atendente humano, por que. Senao, NAO_APLICAVEL.
+- APOS_ERRO_TECNICO: transferida depois de falha de sistema ou dado indisponivel.
+- SOLICITACAO_CLIENTE: o cliente pediu para falar com atendente.
+- VALIDACAO_CADASTRAL: problema para identificar o cliente ou divergencia de cadastro.
+- FORA_ESCOPO_VIC: assunto que a VIC nao trata.
+
+Regra importante: o campo VEREDITO abaixo foi apurado por marcador estrutural da transcricao e e mais confiavel que sua leitura. Quando ele estiver preenchido, respeite-o e use os demais campos apenas para os motivos.
+
+"""
+
+RESPONSE_FORMAT_CLASSIFICACAO = (
+    '{"type":"json_schema","json_schema":{"name":"classificacao_conversa_vic","strict":true,'
+    '"schema":{"type":"object","properties":{'
+    '"tp_desfecho_ia":{"type":"string","enum":["ABANDONO","RECUSA","FORA_ESCOPO","SEM_DESFECHO"]},'
+    '"tp_etapa_abandono_ia":{"type":"string","enum":["ANTES_NOME","APOS_NOME_SEM_CPF","APOS_CPF","NA_PROPOSTA","NA_CONFIRMACAO","SEM_CAUSA_CLARA","NAO_APLICAVEL"]},'
+    '"tp_motivo_recusa_ia":{"type":"string","enum":["SEM_CONDICAO_FINANCEIRA","ENTRADA_MUITO_ALTA","PARCELA_ACIMA_CAPACIDADE","QUER_MAIS_DESCONTO","NAO_RECONHECE_DIVIDA","PREFERE_OUTRO_CANAL","SAIU_APOS_PROPOSTA","NAO_APLICAVEL"]},'
+    '"tp_motivo_transferencia_ia":{"type":"string","enum":["APOS_ERRO_TECNICO","SOLICITACAO_CLIENTE","VALIDACAO_CADASTRAL","FORA_ESCOPO_VIC","NAO_APLICAVEL"]},'
+    '"tx_justificativa_ia":{"type":"string"}},'
+    '"required":["tp_desfecho_ia","tp_etapa_abandono_ia","tp_motivo_recusa_ia","tp_motivo_transferencia_ia","tx_justificativa_ia"],'
+    '"additionalProperties":false}}}'
+)
+
+ESQUEMA_CLASSIFICACAO = (
+    "STRUCT<tp_desfecho_ia STRING, tp_etapa_abandono_ia STRING, tp_motivo_recusa_ia STRING, "
+    "tp_motivo_transferencia_ia STRING, tx_justificativa_ia STRING>"
+)
+
+COLUNAS_CLASSIFICACAO = [
+    "tp_desfecho_ia",
+    "tp_etapa_abandono_ia",
+    "tp_motivo_recusa_ia",
+    "tp_motivo_transferencia_ia",
+    "tx_justificativa_ia",
+]
+
+
+def _literal_sql(texto):
+    """Converte texto Python em literal de string do Spark SQL.
+
+    Necessário porque `ai_query` só existe como função SQL: o prompt tem de atravessar
+    `expr()`. A quebra de linha vira a sequência de escape `\\n`, que o parser do Spark
+    reconverte — literal multilinha dentro de `expr()` é frágil.
+    """
+    escapado = texto.replace("\\", "\\\\").replace("'", "''").replace("\n", "\\n")
+    return f"'{escapado}'"
+
+
+def _aplicar_mapa(coluna, mapa, valor_padrao):
+    """Traduz o código ASCII devolvido pelo modelo no rótulo de negócio.
+
+    Código fora do mapa cai em `valor_padrao` em vez de virar nulo: o `enum` do
+    `responseFormat` já restringe o domínio, e um valor inesperado é sinal de mudança de
+    contrato do endpoint, não de dado ausente.
+    """
+    expressao = None
+    for codigo, rotulo in mapa.items():
+        condicao = coluna == lit(codigo)
+        expressao = when(condicao, lit(rotulo)) if expressao is None else expressao.when(condicao, lit(rotulo))
+    return expressao.otherwise(lit(valor_padrao))
+
+
+def classificar_conversa(df, tabela_destino, coluna_chave="cd_contato_connect", spark=spark): # noqa
+    """Classifica desfecho e motivos, reaproveitando o que já foi classificado.
+
+    Lê as classificações já gravadas em `tabela_destino` e chama `ai_query` apenas para as
+    chaves novas. Ver a nota no topo do notebook sobre por que o cache é obrigatório.
+
+    Espera em `df` as colunas `coluna_chave`, `_tx_dialogo` e `_tp_desfecho_deterministico`.
+
+    Returns:
+        DataFrame com `coluna_chave` mais as colunas de `COLUNAS_CLASSIFICACAO`.
+    """
+    df_pendente = df.select(coluna_chave, "_tx_dialogo", "_tp_desfecho_deterministico")
+
+    df_cache = None
+    if spark.catalog.tableExists(tabela_destino):
+        colunas_destino = set(spark.table(tabela_destino).columns)
+        # A primeira execução após a criação da tabela pela DDL encontra-a vazia e sem as
+        # colunas de justificativa preenchidas; o filtro por não nulo evita reaproveitar
+        # linha sem classificação.
+        if {"tp_desfecho", "tx_justificativa_desfecho"} <= colunas_destino:
+            df_cache = (
+                spark.table(tabela_destino)
+                .filter(col("in_registro_ativo") == lit("Ativo"))
+                .filter(col("tx_justificativa_desfecho").isNotNull())
+                .select(
+                    col(coluna_chave),
+                    col("tp_desfecho").alias("_cache_desfecho"),
+                    col("tp_etapa_abandono").alias("_cache_etapa_abandono"),
+                    col("tp_motivo_recusa").alias("_cache_motivo_recusa"),
+                    col("tp_motivo_transferencia").alias("_cache_motivo_transferencia"),
+                    col("tx_justificativa_desfecho").alias("_cache_justificativa"),
+                )
+            )
+            df_pendente = df_pendente.join(df_cache, on=coluna_chave, how="left_anti")
+
+    qt_pendente = df_pendente.count()
+    print(f"  conversas a classificar por IA: {qt_pendente:,}")
+
+    prompt_sql = (
+        f"concat({_literal_sql(PROMPT_CLASSIFICACAO)}, "
+        f"'VEREDITO: ', coalesce(_tp_desfecho_deterministico, 'nao apurado'), "
+        f"'\\n\\nCONVERSA:\\n', _tx_dialogo)"
+    )
+    chamada_ia = f"ai_query('{MODELO_IA}', {prompt_sql}, responseFormat => '{RESPONSE_FORMAT_CLASSIFICACAO}')"
+
+    # Os códigos ASCII do modelo são traduzidos para rótulo de negócio já aqui, para que a
+    # função devolva o mesmo vocabulário que fica gravado na tabela. Assim o cache é lido
+    # direto, sem mapa invertido.
+    df_novo = (
+        df_pendente.withColumn("_json_ia", expr(chamada_ia))
+        .withColumn("_ia", from_json(col("_json_ia"), ESQUEMA_CLASSIFICACAO))
+        .select(
+            col(coluna_chave),
+            _aplicar_mapa(col("_ia.tp_desfecho_ia"), MAPA_DESFECHO_IA, DESFECHO_NAO_CLASSIFICADO).alias(
+                "tp_desfecho_ia"
+            ),
+            _aplicar_mapa(col("_ia.tp_etapa_abandono_ia"), MAPA_ETAPA_ABANDONO, NAO_APLICAVEL).alias(
+                "tp_etapa_abandono_ia"
+            ),
+            _aplicar_mapa(col("_ia.tp_motivo_recusa_ia"), MAPA_MOTIVO_RECUSA, NAO_APLICAVEL).alias(
+                "tp_motivo_recusa_ia"
+            ),
+            _aplicar_mapa(col("_ia.tp_motivo_transferencia_ia"), MAPA_MOTIVO_TRANSFERENCIA, NAO_APLICAVEL).alias(
+                "tp_motivo_transferencia_ia"
+            ),
+            col("_ia.tx_justificativa_ia").alias("tx_justificativa_ia"),
+        )
+    )
+
+    # A chamada ao modelo é caro e não determinística: materializar aqui garante que ela
+    # aconteça uma única vez, mesmo que o plano seja reavaliado adiante.
+    df_novo = df_novo.cache()
+    df_novo.count()
+
+    if df_cache is None:
+        return df_novo
+
+    df_cache_renomeado = df_cache.select(
+        col(coluna_chave),
+        col("_cache_desfecho").alias("tp_desfecho_ia"),
+        col("_cache_etapa_abandono").alias("tp_etapa_abandono_ia"),
+        col("_cache_motivo_recusa").alias("tp_motivo_recusa_ia"),
+        col("_cache_motivo_transferencia").alias("tp_motivo_transferencia_ia"),
+        col("_cache_justificativa").alias("tx_justificativa_ia"),
+    )
+
+    return df_novo.unionByName(df_cache_renomeado)
+
+
+def consolidar_desfecho(coluna_deterministico, coluna_desfecho_ia):
+    """Combina o veredito determinístico com o da IA, com precedência do determinístico.
+
+    Conversa vinda do cache cujo desfecho foi determinístico traz esse rótulo em
+    `coluna_desfecho_ia`; como o determinístico é recalculado a cada carga e tem
+    precedência, o resultado é o mesmo.
+    """
+    return coalesce(coluna_deterministico, coluna_desfecho_ia, lit(DESFECHO_NAO_CLASSIFICADO))
+
+
+def motivo_condicionado(coluna_desfecho, desfecho_esperado, coluna_motivo, valor_residual=SEM_CAUSA_CLARA):
+    """Só expõe o motivo quando ele é coerente com o desfecho final.
+
+    Duas correções acontecem aqui, ambas observadas na amostra:
+
+    1. O modelo preenche etapa de abandono em conversa que terminou em recusa. Sem o
+       condicional, a soma por motivo não fecharia com a contagem do desfecho no relatório.
+    2. O modelo devolve `NAO_APLICAVEL` para conversa cujo desfecho exige motivo. Nesse
+       caso o valor vira `valor_residual`, para que a seção não exiba "Não aplicável" como
+       fatia do gráfico.
+    """
+    motivo = coalesce(coluna_motivo, lit(NAO_APLICAVEL))
+    motivo_ajustado = when(motivo == lit(NAO_APLICAVEL), lit(valor_residual)).otherwise(motivo)
+
+    return when(coluna_desfecho == lit(desfecho_esperado), motivo_ajustado).otherwise(lit(NAO_APLICAVEL))
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Chaves substitutas
+
+
+def sk_deterministica(*colunas):
+    """Gera surrogate key estável a partir da chave natural.
+
+    `monotonically_increasing_id()` não serve: o valor reinicia a cada execução, o hash do
+    `merge_dinamico` muda sem mudança na origem e a tabela inteira é reinserida a cada
+    carga. Derivar da chave natural também permite ao fato calcular a FK sem join.
+    """
+    partes = [coalesce(c.cast("string"), lit("")) for c in colunas]
+
+    todas_nulas = colunas[0].isNull()
+    for coluna in colunas[1:]:
+        todas_nulas = todas_nulas & coluna.isNull()
+
+    return when(todas_nulas, lit(None).cast("bigint")).otherwise(xxhash64(concat_ws("|", *partes)))
+
+
+def sk_tempo(coluna_data):
+    """Converte data ou timestamp na SK de dimensão tempo, no formato YYYYMMDD."""
+    from pyspark.sql.functions import date_format
+
+    return date_format(coluna_data, "yyyyMMdd").cast("bigint")
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Comentários e validações
+
+
+def aplicar_comentarios(tabela_completa, table_comment, column_comments, spark=spark): # noqa
+    """Aplica comentário de tabela e de colunas.
+
+    `ddl_dinamico` cria e evolui a estrutura, mas não registra comentários, que são
+    obrigatórios pelo AGENTS.md. Idempotente. Coluna do dicionário que não existe na tabela
+    é ignorada com aviso, para que comentário desatualizado não derrube a DDL.
+    """
+    spark.sql(f"COMMENT ON TABLE {tabela_completa} IS '{table_comment.replace(chr(39), chr(39) * 2)}'")
+
+    colunas_existentes = {linha["col_name"] for linha in spark.sql(f"DESCRIBE TABLE {tabela_completa}").collect()}
+
+    qt_aplicado = 0
+    for coluna, comentario in column_comments.items():
+        if coluna not in colunas_existentes:
+            print(f"  aviso: coluna {coluna} nao existe em {tabela_completa}, comentario ignorado")
+            continue
+        spark.sql(f"ALTER TABLE {tabela_completa} ALTER COLUMN {coluna} COMMENT '{comentario.replace(chr(39), chr(39) * 2)}'")
+        qt_aplicado += 1
+
+    print(f"  comentarios aplicados: 1 tabela + {qt_aplicado} colunas")
+
+
+def validar_unicidade(df, chave, rotulo):
+    """Confere que a chave de negócio é única antes da gravação.
+
+    Falha alto: chave duplicada no fato multiplica valor em toda análise a jusante, e o erro
+    é muito mais caro de achar depois da carga.
+    """
+    chaves = [chave] if isinstance(chave, str) else list(chave)
+
+    qt_linha = df.count()
+    qt_chave = df.select(*chaves).distinct().count()
+
+    if qt_linha != qt_chave:
+        raise ValueError(
+            f"{rotulo}: chave {chaves} nao e unica — {qt_linha:,} linhas para "
+            f"{qt_chave:,} chaves distintas ({qt_linha - qt_chave:,} duplicadas)"
+        )
+
+    print(f"  {rotulo}: {qt_linha:,} linhas, chave {chaves} unica")
+    return qt_linha
+
+
+def validar_dominio(df, coluna, valores_aceitos, rotulo):
+    """Confere que a coluna categórica não escapou do domínio fechado do relatório.
+
+    O relatório executivo tem seções com total fechado (distribuição por desfecho, etapa de
+    abandono). Valor fora do domínio apareceria como fatia órfã no gráfico.
+    """
+    fora = df.filter(col(coluna).isNotNull() & ~col(coluna).isin(list(valores_aceitos)))
+    qt_fora = fora.count()
+
+    if qt_fora > 0:
+        exemplos = [linha[coluna] for linha in fora.select(coluna).distinct().limit(5).collect()]
+        raise ValueError(f"{rotulo}: {qt_fora:,} linhas com {coluna} fora do dominio. Exemplos: {exemplos}")
+
+    print(f"  {rotulo}: {coluna} dentro do dominio ({len(valores_aceitos)} valores)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Anonimização para compartilhamento externo
+# MAGIC
+# MAGIC ### Por que hash de CPF sem salt não anonimiza
+# MAGIC
+# MAGIC O CPF tem 11 dígitos com dois verificadores, o que dá cerca de 10⁹ valores válidos.
+# MAGIC Calcular o SHA-256 de todos eles e montar a tabela reversa é trabalho de minutos em
+# MAGIC hardware comum. `sha2(cpf)` publicado equivale a publicar o CPF.
+# MAGIC
+# MAGIC Por isso o pseudônimo usa **salt** guardado em secret scope. Sem o salt, a tabela reversa
+# MAGIC não pode ser montada; com ele, o pseudônimo é estável entre execuções e continua servindo
+# MAGIC para contar contatos por cliente nos relatórios internos.
+# MAGIC
+# MAGIC ### Por que não basta remover a coluna de identificação
+# MAGIC
+# MAGIC O dado pessoal está **dentro do texto da conversa**, não só na coluna de chave. Medido nas
+# MAGIC 115 conversas da amostra:
+# MAGIC
+# MAGIC | Conteúdo | Contatos |
+# MAGIC | --- | --- |
+# MAGIC | CPF em formato reconhecível | 70 |
+# MAGIC | Telefone | 62 |
+# MAGIC | URL | 14 |
+# MAGIC | URL de boleto no blob de armazenamento | 8 |
+# MAGIC | Token de acesso assinado (`sig=`) | 8 |
+# MAGIC | E-mail | 2 |
+# MAGIC
+# MAGIC A URL do boleto é o caso mais grave: o nome do arquivo carrega o **nome completo** do
+# MAGIC cliente (`ERALINA-CAROLINE-PEREIRA-DOS-SANTOS-BOLETO.pdf`) e a assinatura SAS vale
+# MAGIC **até 2031**. Compartilhar a transcrição crua entrega uma credencial ativa de download do
+# MAGIC documento de dívida, não apenas um dado cadastral.
+# MAGIC
+# MAGIC Além disso o assistente repete o primeiro nome ao longo do diálogo ("Obrigada, Robson!"),
+# MAGIC e o `DisplayName` do WhatsApp traz o nome do perfil.
+
+# COMMAND ----------
+
+# DBTITLE 1,Pseudonimização
+
+SCOPE_SEGREDO = "bbts"
+CHAVE_SALT_PSEUDONIMO = "vic-connect-salt-pseudonimo"
+
+
+def obter_salt(scope=SCOPE_SEGREDO, chave=CHAVE_SALT_PSEUDONIMO):
+    """Lê o salt do secret scope.
+
+    Falha alto quando o segredo não existe. O contrário — cair num salt padrão ou em string
+    vazia — produziria pseudônimo reversível por tabela reversa sem nenhum aviso, que é
+    exatamente o risco que esta função existe para evitar.
+
+    Para criar o segredo uma única vez, pela CLI do Databricks:
+        databricks secrets put-secret bbts vic-connect-salt-pseudonimo
+
+    O valor deve ser aleatório, com pelo menos 32 bytes, e nunca versionado no repositório.
+    """
+    try:
+        salt = dbutils.secrets.get(scope=scope, key=chave) # noqa
+    except Exception as erro: # noqa
+        raise ValueError(
+            f"Segredo {scope}/{chave} nao encontrado. O pseudonimo NAO pode ser gerado sem salt: "
+            f"sha2 de CPF sem salt e reversivel por tabela reversa. Crie o segredo antes de rodar. "
+            f"Erro original: {str(erro).split(chr(10))[0]}"
+        )
+
+    if not salt or len(salt) < 16:
+        raise ValueError(
+            f"Segredo {scope}/{chave} vazio ou curto demais. Use valor aleatorio de 32 bytes ou mais."
+        )
+
+    return salt
+
+
+def pseudonimo(coluna, salt, prefixo=""):
+    """Gera pseudônimo estável e não reversível a partir de uma chave.
+
+    Estável porque depende só do valor e do salt: a mesma pessoa recebe o mesmo pseudônimo em
+    toda execução, o que permite contar contatos por cliente sem conhecer o cliente.
+
+    O `prefixo` separa domínios: o pseudônimo de conversa e o de cliente derivados do mesmo
+    texto não podem colidir, senão seria possível inferir relação entre eles.
+
+    Devolve nulo quando a chave é nula — sem isso, todos os clientes não identificados
+    receberiam o mesmo pseudônimo e pareceriam ser a mesma pessoa.
+    """
+    return when(
+        coluna.isNotNull() & (coluna.cast("string") != lit("")),
+        sha2(concat(lit(prefixo), lit(salt), coluna.cast("string")), 256),
+    ).otherwise(lit(None).cast("string"))
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Redação de dado pessoal no texto
+
+# Padrões aplicados na ordem em que aparecem. A ordem importa: a URL vem primeiro porque
+# carrega nome e credencial dentro dela, e redigir CPF antes deixaria a URL parcialmente
+# mutilada e mais difícil de casar.
+PADRAO_REDACAO = [
+    # URL inteira, incluindo query string. É onde está a assinatura SAS do boleto.
+    (r"(?i)https?://[^\s\"'<>]+", "[URL_REMOVIDA]"),
+    # CNPJ antes de CPF: 14 dígitos casariam parcialmente no padrão de 11.
+    (r"[0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2}", "[CNPJ]"),
+    (r"[0-9]{3}\.?[0-9]{3}\.?[0-9]{3}-?[0-9]{2}", "[CPF]"),
+    (r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", "[EMAIL]"),
+    # Telefone com ou sem DDD e separadores. Inclui os números públicos da BBTS que aparecem no
+    # roteiro de encerramento: redigir a mais é preferível a manter um padrão que possa vazar
+    # telefone de cliente.
+    (r"\(?[0-9]{2}\)? ?9?[0-9]{4}[- ]?[0-9]{4}", "[TELEFONE]"),
+    # Linha digitável e código de barras de boleto: 44 a 48 dígitos, com ou sem espaço.
+    (r"[0-9]{5}[\. ]?[0-9]{5}[\. ]?[0-9]{5}[\. ]?[0-9]{6}[\. ]?[0-9]{5}[\. ]?[0-9]{6}[\. ]?[0-9]{1}[\. ]?[0-9]{14}", "[LINHA_DIGITAVEL]"),
+]
+
+# Palavras que aparecem em nome de perfil de WhatsApp mas não identificam ninguém. Sem esta
+# lista, um perfil como "Amor a ti meu Deus" faria a redação apagar "meu", "amor" e "vida" de
+# todas as conversas, destruindo o texto que a avaliação externa precisa ler.
+STOPWORD_NOME = {
+    "amor", "deus", "jesus", "cristo", "santa", "santo", "vida", "tudo", "meu", "minha", "nossa",
+    "nosso", "esta", "este", "como", "para", "por", "com", "sem", "dos", "das", "sao", "the",
+    "ltda", "eireli", "matriz", "filial", "escola", "empresa", "familia", "graca", "fe", "paz",
+    "amem", "gratidao", "abencoado", "abencoada", "senhor", "senhora", "mae", "pai", "filho",
+    "filha", "bom", "boa", "feliz", "luz", "sol", "flor", "anjo", "rei", "reino", "gloria",
+}
+
+TAMANHO_MINIMO_TOKEN_NOME = 3
+
+
+def montar_tokens_nome(*colunas_nome):
+    """Monta a lista de palavras a redigir a partir das fontes de nome da conversa.
+
+    Recebe as colunas de nome disponíveis — nome do perfil do WhatsApp, nome do cadastro do CRM
+    e nome do atendente — e devolve um array de palavras.
+
+    Três cuidados, todos por causa de dado real observado na amostra:
+
+    1. **Remove tudo que não é letra ou dígito de cada palavra.** Nome de perfil traz emoji e
+       parêntese, que são metacaracteres de expressão regular e quebrariam o padrão de redação.
+    2. **Descarta palavra com menos de três letras**, que casaria dentro de outras palavras.
+    3. **Descarta stopword**, senão perfis devocionais apagariam palavras comuns do texto.
+    """
+    nomes_validos = [coalesce(c, lit("")) for c in colunas_nome]
+    palavras = split(concat_ws(" ", *nomes_validos), r"[\s]+")
+
+    limpas = transformar_array(palavras, lambda p: regexp_replace(p, r"[^a-zA-ZÀ-ÿ0-9]", ""))
+
+    return array_distinct(
+        filtrar_array(
+            limpas,
+            lambda p: (length(p) >= lit(TAMANHO_MINIMO_TOKEN_NOME))
+            & ~lower(p).isin(*sorted(STOPWORD_NOME)),
+        )
+    )
+
+
+def anonimizar_texto(coluna_texto, coluna_tokens_nome):
+    """Redige dado pessoal do texto da conversa.
+
+    Aplica primeiro os padrões estruturais de `PADRAO_REDACAO` e depois, palavra por palavra, os
+    nomes de `coluna_tokens_nome`.
+
+    A redação de nome usa `aggregate` sobre o array em vez de função definida pelo usuário: a
+    lista de nomes varia por linha, e `aggregate` resolve isso no motor do Spark, sem o custo de
+    serialização de uma UDF em Python.
+
+    O limite de palavra `\\b` evita que um nome curto como "Ana" case dentro de "Analista".
+    """
+    texto_estrutural = coluna_texto
+    for padrao, substituto in PADRAO_REDACAO:
+        texto_estrutural = regexp_replace(texto_estrutural, padrao, substituto)
+
+    return aggregate(
+        coluna_tokens_nome,
+        texto_estrutural,
+        lambda acumulado, palavra: regexp_replace(
+            acumulado, concat(lit(r"(?i)\b"), palavra, lit(r"\b")), lit("[NOME]")
+        ),
+    )
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Gate de PII residual
+
+# Padrões que não podem sobrar no texto anonimizado. É a verificação de saída: as regras de
+# redação podem falhar por grafia nova na origem, e este gate transforma isso em erro de carga
+# em vez de vazamento silencioso para fora da empresa.
+PADRAO_PII_PROIBIDO = [
+    ("cpf", r"[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}"),
+    ("sequencia_11_digitos", r"(^|[^0-9])[0-9]{11}([^0-9]|$)"),
+    ("url", r"(?i)https?://"),
+    ("token_assinado", r"(?i)[?&]sig="),
+    ("email", r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}"),
+    # Payload de template do Connect. Não deveria chegar aqui, porque montar_dialogo já o
+    # descarta; o padrão fica como rede de segurança, já que o bloco traz nome, CPF e telefone
+    # rotulados e um token de acesso.
+    ("payload_template", r"(?i)(viewresource|viewtoken|templatetype)"),
+]
+
+
+def validar_ausencia_pii(df, coluna_texto, rotulo, colunas_proibidas=None):
+    """Confere que o texto anonimizado não tem PII residual e que a tabela não tem coluna proibida.
+
+    Falha alto de propósito. Esta é a última barreira antes de um dado sair da empresa: um aviso
+    no log seria ignorado, e o custo do erro aqui é vazamento de dado pessoal de cliente.
+    """
+    colunas_atuais = set(df.columns)
+    proibidas_presentes = sorted(colunas_atuais & set(colunas_proibidas or []))
+    if proibidas_presentes:
+        raise ValueError(
+            f"{rotulo}: a tabela destinada a compartilhamento externo contem coluna identificadora: "
+            f"{proibidas_presentes}. Remova do select."
+        )
+
+    achados = []
+    for nome_padrao, padrao in PADRAO_PII_PROIBIDO:
+        qt = df.filter(col(coluna_texto).isNotNull() & col(coluna_texto).rlike(padrao)).count()
+        if qt > 0:
+            achados.append(f"{nome_padrao}={qt}")
+
+    if achados:
+        exemplo = (
+            df.filter(col(coluna_texto).rlike(PADRAO_PII_PROIBIDO[0][1]))
+            .select(coluna_texto)
+            .limit(1)
+            .collect()
+        )
+        raise ValueError(
+            f"{rotulo}: PII residual em {coluna_texto} apos anonimizacao: {', '.join(achados)}. "
+            f"A carga foi interrompida para nao expor dado pessoal. "
+            f"Revise PADRAO_REDACAO. Trecho de exemplo: {str(exemplo)[:200]}"
+        )
+
+    print(f"  {rotulo}: {coluna_texto} sem PII residual nos {len(PADRAO_PII_PROIBIDO)} padroes verificados")
