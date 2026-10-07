@@ -1,145 +1,298 @@
 CONTEXTO DO PROJETO
 
-Estou desenvolvendo um pipeline Databricks + Spark para classificação de conversas da assistente virtual VIC.
+Estou desenvolvendo um pipeline Databricks + PySpark para classificar conversas da assistente virtual VIC.
 
-O objetivo é gerar a tabela fat_conversa_vic contendo o desfecho final de cada conversa.
+O objetivo é gerar a tabela fat_conversa_vic, contendo uma linha por conversa e seu respectivo desfecho final.
 
-A arquitetura atual possui:
+A arquitetura atual utiliza:
 
-Amazon Connect ChatTranscript
-Amazon Connect Analysis (Contact Lens)
-Enriquecimento CRM via CPF
-Classificação determinística
-Classificação via IA apenas para casos residuais
+- Amazon Connect ChatTranscript
+- Amazon Connect Analysis, com dados do Contact Lens
+- Enriquecimento com dados do CRM por CPF
+- Classificação determinística para casos identificáveis por regras
+- Classificação por IA somente para casos residuais
+- Databricks Workflows para execução do notebook
+- Terraform para implantação em produção
+
+OBJETIVO PRINCIPAL
+
+Simplificar o código ao máximo, preservar a lógica atual e tornar o processamento performático e operacionalmente seguro.
+
+A solução deve:
+
+1. Executar a classificação determinística primeiro.
+2. Enviar para a IA somente registros residuais.
+3. Evitar reexecuções desnecessárias do ai_query.
+4. Evitar múltiplas ações Spark sobre o mesmo DataFrame.
+5. Evitar alterações estruturais que não sejam necessárias para corrigir o problema.
+6. Manter os domínios e regras existentes no vic_classification_helpers.
+7. Preservar os nomes atuais das colunas, funções e tabelas sempre que possível.
+8. Ser compatível com as validações de Terraform e linting utilizadas pela empresa.
+
 PROBLEMA PRINCIPAL
 
-A implementação atual ficou pesada e difícil de operacionalizar.
+A classificação por IA foi integrada à linhagem principal do DataFrame.
 
-A classificação por IA foi integrada ao fluxo principal e qualquer ação Spark está ficando extremamente lenta.
+Como o Spark utiliza avaliação lazy, ações como:
 
-Objetivo: simplificar ao máximo e tornar o processamento performático.
+- count()
+- collect()
+- show()
+- display()
+- first()
+- gravações
+- validações de domínio
+- validações de unicidade
 
-RESTRIÇÕES IMPORTANTES
-Terraform
+podem executar novamente toda a linhagem, incluindo o ai_query.
 
-Não podemos utilizar operador & em expressões Python/PySpark porque o Terraform/Linter da empresa acusa erro.
+Isso tornou o notebook lento e difícil de operacionalizar.
 
-Exemplo:
+O notebook já conseguiu executar corretamente por Databricks Workflow. Portanto, as próximas alterações devem ser pequenas, controladas e focadas principalmente em compatibilidade com Terraform e linting.
 
-Python
+RESTRIÇÃO CRÍTICA DO TERRAFORM
+
+Não utilizar o operador Python/PySpark `&` para combinar condições.
+
+Exemplo proibido:
+
 (col("a") == 1) & (col("b") == 2)
 
-Deve ser substituído sempre por:
+IMPORTANTE:
 
-Python
+Também não substituir diretamente `&` por `and` entre objetos PySpark Column.
+
+Este código também é inválido:
+
 (col("a") == 1) and (col("b") == 2)
 
-ou preferência por:
+O operador Python `and` tenta converter uma Column do Spark em booleano Python e pode gerar o erro:
 
-Python
-F.when(
-(condicao1) and (condicao2)
-)
+Cannot convert column into bool
 
-Sempre considerar essa restrição.
+FORMAS PERMITIDAS
 
-CENÁRIO ATUAL
-
-Tenho aproximadamente:
-
-Plain Text
-37.000 registros
-
-Após aplicar regras determinísticas:
-
-Plain Text
-20.543 registros classificados
-
-Sobram aproximadamente:
-
-Plain Text
-17.000 registros
-
-para classificação por IA.
-
-REGRAS DE NEGÓCIO
-
-Existem desfechos que podem ser determinados sem IA.
-
-Exemplos:
-
-Plain Text
-Acordo fechado
-Segunda via boleto
-Transferido para atendente
-Sem dívida
-Erro técnico
-Fora do horário
-Sem interação do cliente
-
-Esses casos NÃO deveriam passar pelo modelo.
-
-ARQUITETURA DESEJADA
-
-Quero uma arquitetura simples.
-
-Passo 1:
-
-Plain Text
-Leitura das fontes
-
-Passo 2:
-
-Plain Text
-Aplicar regras determinísticas
-
-Passo 3:
-
-Plain Text
-Separar:
-Python
-df_deterministico
-
-e
-
-Python
-df_pendente
-
-Onde:
-
-Python
-df_deterministico =
-_tp_desfecho_deterministico IS NOT NULL
-
-e
-
-Python
-df_pendente =
-_tp_desfecho_deterministico IS NULL
-OBJETIVO
-
-Quero gravar imediatamente os registros determinísticos.
+Opção 1, preferencial: utilizar F.expr() com operadores SQL.
 
 Exemplo:
 
-Python
-df_deterministico.write \
-.format("delta") \
-.mode("append") \
-.saveAsTable(...)
+df.filter(
+    F.expr(
+        "a = 1 AND b = 2"
+    )
+)
 
-Sem passar pela IA.
+Opção 2: encadear filtros quando as condições forem equivalentes a um AND.
 
-Depois executar IA somente para:
+Exemplo:
 
-Python
-df_pendente
+df.filter(
+    F.col("a") == F.lit(1)
+).filter(
+    F.col("b") == F.lit(2)
+)
 
-E gravar o resultado da IA separadamente.
+Opção 3: utilizar F.expr() dentro de F.when().
 
-PROBLEMAS ENCONTRADOS
-ai_query extremamente lento
+Exemplo:
 
-Mesmo com poucos registros.
+F.when(
+    F.expr(
+        "a = 1 AND b = 2"
+    ),
+    F.lit("resultado")
+)
 
-Queremos reduzir ao máximo as chamadas.
+Opção 4: criar condições auxiliares separadas e aplicá-las em etapas independentes, desde que a lógica original seja preservada.
+
+REGRAS PARA CONVERSÃO DAS CONDIÇÕES
+
+1. Antes de substituir qualquer operador, identificar a lógica original.
+2. Preservar exatamente a precedência entre AND, OR e NOT.
+3. Não trocar automaticamente `&` por `and`.
+4. Não trocar automaticamente `|` por `or`.
+5. Não usar `not` diretamente sobre uma Column PySpark.
+6. Para condições compostas, preferir `F.expr()` com:
+   - AND
+   - OR
+   - NOT
+   - IS NULL
+   - IS NOT NULL
+   - IN
+   - NOT IN
+7. Quando utilizar SQL em `F.expr()`, proteger nomes de colunas com crases quando necessário.
+8. Quando houver valores dinâmicos, escapar corretamente strings antes de montar a expressão SQL.
+9. Quando as condições forem apenas filtros cumulativos, preferir vários `.filter()` encadeados.
+10. Antes de devolver o código, verificar se ainda existe algum uso dos operadores:
+    - &
+    - |
+    - ~
+11. Não alterar a regra de negócio apenas para atender ao linter.
+12. Se uma condição não puder ser convertida com segurança, explicar o ponto exato em vez de inventar uma nova lógica.
+
+EXEMPLOS DE CONVERSÃO
+
+Exemplo 1: AND simples
+
+Antes:
+
+df.filter(
+    (F.col("a") == 1) & (F.col("b") == 2)
+)
+
+Depois:
+
+df.filter(
+    F.expr(
+        "a = 1 AND b = 2"
+    )
+)
+
+Exemplo 2: filtros encadeados
+
+Antes:
+
+df.filter(
+    F.col("a").isNotNull()
+    & F.col("b").isNotNull()
+)
+
+Depois:
+
+df.filter(
+    F.col("a").isNotNull()
+).filter(
+    F.col("b").isNotNull()
+)
+
+Exemplo 3: NOT IN
+
+Antes:
+
+df.filter(
+    F.col("tp_desfecho").isNotNull()
+    & ~F.col("tp_desfecho").isin(valores_aceitos)
+)
+
+Depois, preferencialmente:
+
+valores_sql = ", ".join(
+    f"'{str(valor).replace(chr(39), chr(39) * 2)}'"
+    for valor in valores_aceitos
+)
+
+df.filter(
+    F.expr(
+        "tp_desfecho IS NOT NULL "
+        f"AND tp_desfecho NOT IN ({valores_sql})"
+    )
+)
+
+Exemplo 4: AND com OR
+
+Antes:
+
+df.filter(
+    (F.col("a") == 1)
+    & (
+        (F.col("b") == 2)
+        | (F.col("c") == 3)
+    )
+)
+
+Depois:
+
+df.filter(
+    F.expr(
+        "a = 1 AND (b = 2 OR c = 3)"
+    )
+)
+
+Exemplo 5: condição em when
+
+Antes:
+
+F.when(
+    F.col("a").isNotNull()
+    & (F.col("b") == F.lit("ATIVO")),
+    F.lit("válido")
+)
+
+Depois:
+
+F.when(
+    F.expr(
+        "a IS NOT NULL AND b = 'ATIVO'"
+    ),
+    F.lit("válido")
+)
+
+DIRETRIZES DE PERFORMANCE
+
+1. Não adicionar count() apenas para diagnóstico ou impressão.
+2. Considerar que persist() sozinho não executa o DataFrame.
+3. Utilizar uma ação de materialização somente quando realmente necessária.
+4. Não materializar o mesmo DataFrame várias vezes.
+5. Não executar várias validações isoladas se elas puderem ser consolidadas em uma única agregação.
+6. Evitar collect() sem limit().
+7. Não executar count() seguido de collect() sobre o mesmo DataFrame de erro.
+8. A classificação por IA deve ocorrer somente para registros sem classificação determinística, exceto quando algum campo complementar ainda depender da IA.
+9. Não consultar a tabela destino para reaproveitamento de classificação enquanto essa funcionalidade não for necessária.
+10. Não adicionar cache, checkpoint, tabela temporária ou reprocessamento sem demonstrar a necessidade.
+11. Não utilizar localCheckpoint(), pois o ambiente atual utiliza Spark Connect e essa operação não está implementada.
+12. Após persistir um DataFrame, executar unpersist() somente depois das validações e da gravação.
+13. Evitar qualquer abordagem que possa executar novamente o ai_query durante validações ou gravações.
+
+DIRETRIZES PARA AS VALIDAÇÕES
+
+As validações existentes incluem:
+
+- Unicidade de cd_contato_connect
+- Domínio de tp_desfecho
+- Domínio de tp_etapa_abandono
+- Domínio de tp_motivo_recusa
+- Domínio de tp_motivo_transferencia
+- Quantidade de contatos
+- Quantidade de jornadas distintas
+- Cobertura de CPF
+- Cobertura de pessoa no CRM
+- Distribuição por desfecho
+
+Sempre que possível, consolidar essas verificações em uma única chamada `agg()`.
+
+Não alterar os domínios existentes no vic_classification_helpers.
+
+Não remover validações sem explicar claramente o impacto.
+
+Não utilizar várias ações Spark quando uma única agregação produzir o mesmo resultado.
+
+FORMA ESPERADA DA RESPOSTA
+
+Ao analisar ou corrigir o código:
+
+1. Identificar exatamente onde está o problema.
+2. Informar quais trechos precisam ser alterados.
+3. Preservar a lógica de negócio existente.
+4. Entregar o código final completo do trecho alterado.
+5. Não adicionar funções, colunas ou regras que não foram solicitadas.
+6. Não propor uma nova arquitetura sem necessidade.
+7. Não fornecer várias alternativas quando uma solução objetiva for suficiente.
+8. Não utilizar `&`, `|` ou `~` no código entregue.
+9. Não utilizar `and`, `or` ou `not` diretamente entre objetos PySpark Column.
+10. Preferir `F.expr()` com operadores SQL para condições compostas.
+11. Informar se a alteração pode disparar uma ação Spark ou reexecutar o ai_query.
+12. Ser rápido, objetivo e focado na correção solicitada.
+
+VALIDAÇÃO FINAL OBRIGATÓRIA
+
+Antes de devolver qualquer código:
+
+1. Verificar se existe `&`, `|` ou `~`.
+2. Verificar se existe `and`, `or` ou `not` entre objetos Column.
+3. Verificar se a lógica original de AND, OR e NOT foi preservada.
+4. Verificar se foram adicionados count(), collect(), display(), show() ou first() desnecessários.
+5. Verificar se alguma alteração pode reexecutar o ai_query.
+6. Verificar se os nomes atuais de colunas, funções e domínios foram preservados.
+7. Verificar se o código é válido em Databricks com PySpark e Spark Connect.
+8. Apresentar somente a alteração necessária para a solicitação atual.
+
