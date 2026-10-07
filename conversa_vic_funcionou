@@ -1,4 +1,44 @@
-
+# Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
+# MAGIC %md
+# MAGIC # Carga: `fat_conversa_vic`
+# MAGIC
+# MAGIC **Origem:** `bbts_amazon_connect.analysis.chat` +
+# MAGIC `bbts_amazon_connect.connect_bbts_cobranca.chattranscripts` + `bbts_prdim.pessoa.pessoa`
+# MAGIC
+# MAGIC **Destino:** `{catalogo}.trusted.fat_conversa_vic`
+# MAGIC
+# MAGIC **Grão:** um contato (`ContactId` do Amazon Connect).
+# MAGIC
+# MAGIC **Estratégia:** `merge_dinamico` (SCD2), com o conjunto completo em cada execução.
+# MAGIC
+# MAGIC ## Decisões desta carga
+# MAGIC
+# MAGIC - **As duas origens são unidas, e isso não é redundância.** Elas são amostras
+# MAGIC   **sobrepostas**: 69 `ContactId` em comum, 23 só em `analysis.chat`, 23 só em
+# MAGIC   `chattranscripts` — universo real de **115 contatos**, não 92. Ler só a tabela de
+# MAGIC   análise perderia 20% do universo e subestimaria toda taxa do relatório.
+# MAGIC - **Os 23 ausentes da análise são contatos que nunca viraram diálogo:** 18 só exibiram um
+# MAGIC   template `ViewResource` e 5 receberam a mensagem de fora do horário comercial. O Contact
+# MAGIC   Lens não gera análise para contato sem conversa, e é por isso que eles faltam lá. Viram
+# MAGIC   os desfechos `Sem interação do cliente` e `Fora do horário de atendimento`.
+# MAGIC - **`analysis.chat` tem precedência no union**, porque carrega sentimento, resumos e
+# MAGIC   tempos de resposta. `in_analise_contact_lens` marca quem tem esses campos; nos outros
+# MAGIC   eles ficam nulos, que é a informação correta — não houve análise, não é "sentimento zero".
+# MAGIC - **Sem filtro `in_registro_ativo` na origem.** Nenhuma das duas tem colunas de controle
+# MAGIC   SCD2 — são ingestão direta do S3, particionadas por `year/month/day` de carga. A
+# MAGIC   deduplicação é pelo `ContactId`, mantendo a partição mais recente.
+# MAGIC - **Data da conversa vem da transcrição, não da partição.** A partição é data de carga:
+# MAGIC   na amostra atual, conversas de junho a setembro chegaram todas em `day=11` de setembro.
+# MAGIC   Usar a partição colocaria o relatório inteiro num único dia.
+# MAGIC - **Desfecho híbrido.** Marcador estrutural decide o que é inequívoco; a IA decide o
+# MAGIC   residual e os motivos. Ver a justificativa no topo de `_helpers`.
+# MAGIC - **`cd_contato_inicial_connect` permite agrupar a jornada.** Para contato transferido
+# MAGIC   entre fluxos, o Connect cria novo `ContactId` apontando para o inicial. Hoje os dois são
+# MAGIC   sempre iguais na amostra, mas sem a coluna o vínculo seria irrecuperável depois.
 
 # COMMAND ----------
 
@@ -8,7 +48,13 @@
 # COMMAND ----------
 
 # DBTITLE 1,Helpers do projeto
-# MAGIC %run ../../_helpers
+# MAGIC %run ../_helpers_funcionou
+
+# COMMAND ----------
+
+from pyspark.sql.functions import array_max, array_min, coalesce, col, lit,  row_number, size, to_date, to_timestamp, unix_timestamp, to_timestamp
+from pyspark.sql.functions import dayofmonth, month, year, current_date
+from pyspark.sql.window import Window
 
 # COMMAND ----------
 
@@ -29,7 +75,7 @@ from pyspark.sql.window import Window
 
 catalogo_connect = uc_catalog_name("bbts_amazon_connect") # noqa
 catalogo_prdim = uc_catalog_name("bbts_prdim") # noqa
-catalogo_escrita = uc_catalog_name("vic_connect") # noqa
+catalogo_escrita = uc_catalog_name("cobranca") # noqa
 schema_escrita = "trusted"
 tabela_escrita = "fat_conversa_vic"
 
@@ -48,34 +94,35 @@ print(f"Destino:           {tabela_destino}")
 # DBTITLE 1,Ler a análise do Contact Lens
 # Campos aninhados são achatados aqui para que o union com a transcrição bruta, que não os tem,
 # funcione por nome de coluna.
-df_analise = spark.table(tabela_analise).select(
-    col("CustomerMetadata_ContactId").alias("cd_contato_connect"),
+df_analise = spark.table(tabela_analise).filter(
+    to_date(col("ts_modificacao_arquivo")) == current_date()
+).select(
+    col("CustomerMetadata.ContactId").alias("cd_contato_connect"),
     col("Transcript"),
-    col("ConversationCharacteristics_ResponseTime.AutomatedInteractionGreetingTimeMillis")
-    .cast("bigint")
-    .alias("te_saudacao_assistente_milissegundo"),
-    col("ConversationCharacteristics_ResponseTime.DetailsByParticipantRole.CUSTOMER.Average.ValueMillis")
-    .cast("bigint")
-    .alias("te_resposta_media_cliente_milissegundo"),
-    col("ConversationCharacteristics_Sentiment.OverallSentiment.DetailsByParticipantRole.CUSTOMER")
-    .cast("double")
-    .alias("vl_sentimento_cliente"),
-    col("ConversationCharacteristics_ContactSummary.AutomatedInteractionSummary.Content")
-    .cast("string")
-    .alias("tx_resumo_automatico"),
-    col("ConversationCharacteristics_ContactSummary.PostContactSummary.Content")
-    .cast("string")
-    .alias("tx_resumo_pos_contato"),
+    col("ConversationCharacteristics.ResponseTime.AutomatedInteractionGreetingTimeMillis").alias("te_saudacao_assistente_milissegundo"),
+    col("ConversationCharacteristics.ResponseTime.DetailsByParticipantRole.CUSTOMER.Average.ValueMillis").alias("te_resposta_media_cliente_milissegundo"),
+    col("ConversationCharacteristics.Sentiment.OverallSentiment.DetailsByParticipantRole.CUSTOMER").alias("vl_sentimento_cliente"),
+    col("ConversationCharacteristics.ContactSummary.AutomatedInteractionSummary.Content").alias("tx_resumo_automatico"),
+    col("ConversationCharacteristics.ContactSummary.PostContactSummary.Content").alias("tx_resumo_pos_contato"),
     lit(True).alias("in_analise_contact_lens"),
-    col("year"),
-    col("month"),
-    col("day"),
+    col("Transcript.AbsoluteTime").alias("year"),
+    col("Transcript.AbsoluteTime").alias("month"),
+    col("Transcript.AbsoluteTime").alias("day"),
 )
 
 # COMMAND ----------
 
-# DBTITLE 1,Ler a transcrição bruta e completar o universo
-# As duas origens são amostras SOBREPOSTAS, não uma contida na outra: 69 ContactId em comum,
+df_analise = df_analise.withColumn(
+    "year", year(array_min(col("year")))
+).withColumn(
+    "month", month(array_min(col("month")))
+).withColumn(
+    "day", dayofmonth(array_min(col("day")))
+)
+
+# COMMAND ----------
+
+#As duas origens são amostras SOBREPOSTAS, não uma contida na outra: 69 ContactId em comum,
 # 23 só em cada lado, totalizando 115 contatos. Ler apenas `analysis.chat` perderia 23
 # contatos (20% do universo) e subestimaria toda taxa do relatório.
 #
@@ -88,15 +135,24 @@ df_transcricao_faltante = df_transcricao_bruta.join(
     df_analise.select("cd_contato_connect"),
     df_transcricao_bruta["ContactId"] == df_analise["cd_contato_connect"],
     how="left_anti",
-).select(
+    ).select(
     col("ContactId").alias("cd_contato_connect"),
     col("Transcript"),
     lit(False).alias("in_analise_contact_lens"),
-    col("year"),
-    col("month"),
-    col("day"),
+    col("Transcript.AbsoluteTime").alias("year"),
+    col("Transcript.AbsoluteTime").alias("month"),
+    col("Transcript.AbsoluteTime").alias("day"),
 )
+df_transcricao_faltante =  df_transcricao_faltante.withColumn(
+    "year", year(array_min(col("year")))
+).withColumn(
+    "month", month(array_min(col("month")))
+).withColumn(
+    "day", dayofmonth(array_min(col("day"))))
 
+# COMMAND ----------
+
+# DBTITLE 1,Ler a transcrição bruta e completar o universo
 # allowMissingColumns preenche com nulo os campos do Contact Lens que a transcrição bruta não
 # tem. Nulo aqui é a informação correta: não houve análise, e não "sentimento zero".
 df_chat_bruto = df_analise.unionByName(df_transcricao_faltante, allowMissingColumns=True)
